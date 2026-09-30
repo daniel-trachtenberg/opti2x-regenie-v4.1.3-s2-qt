@@ -1,0 +1,256 @@
+--- a/src/Geno.cpp
++++ b/src/Geno.cpp
+@@ -27,6 +27,8 @@
+ #include "Regenie.hpp"
+ #include "Files.hpp"
+ #include "Geno.hpp"
++#include <cstring>
++#include <cstdint>
+ #include "db/sqlite3.hpp"
+ 
+ using namespace std;
+@@ -2415,6 +2417,143 @@
+ 
+   int hc, lval, ncarriers = 0, nmales;
+   bool non_par = in_non_par(chrom, infosnp->physpos, params);
++
++  // Opti2x H-S2-10: double LUT + all-in-analysis hot path (Wave2 on H-S2-6/8 stack)
++  if(params->test_mode && !non_par && !params->af_cc && !params->build_mask && (params->test_type == 0) && !params->htp_out){
++    // static double LUT: same mapping as buildLookupTable maptogeno (avoids int8->double cast)
++    static double dlut[256][4];
++    static bool lut_ready = false;
++    if(!lut_ready){
++      const double maptogeno[4] = {2.0, -3.0, 1.0, 0.0};
++      for(int bi=0;bi<256;bi++){
++        for(int j=0;j<4;j++){
++          int bit_start = j<<1;
++          dlut[bi][j] = maptogeno[ (bi >> bit_start) & 3 ];
++        }
++      }
++      lut_ready = true;
++    }
++    uint32_t const nmax = filters->ind_ignore.size();
++    uint32_t i = 0, index = 0;
++    double total = 0;
++    double* __restrict__ gptr = gblock->Gmat.col(isnp).data();
++    const bool any_ignore = filters->ind_ignore.any();
++    if(any_ignore) std::memset(gptr, 0, sizeof(double) * params->n_samples);
++    MapArXd Geno (gptr, params->n_samples, 1);
++    prep_snp_stats(snp_data, params);
++    // reuse missing index buffer across SNPs (thread-local; OpenMP-safe with threads=1 or per-thread TLS)
++    static thread_local std::vector<uint32_t> missing_idx;
++    missing_idx.clear();
++    if(missing_idx.capacity() < 64) missing_idx.reserve(64);
++    snp_data->n_zero = 0; // unused under H-S2-8 force-dense; skip per-geno n_zero++
++    const bool ref_first = params->ref_first;
++    const bool split_pheno = params->split_by_pheno;
++    const bool* __restrict__ ignore = filters->ind_ignore.data();
++    const bool* __restrict__ in_an = filters->ind_in_analysis.data();
++    const uchar* __restrict__ bed = bed_data.data();
++    const size_t nbytes = bed_data.size();
++    const bool all_in = !any_ignore && filters->ind_in_analysis.all() && ((uint32_t)params->n_samples == nmax);
++
++    if(all_in && !ref_first){
++      // Ultra-hot: N bed samples == N analysis, all kept, diploid autosomal additive
++      const size_t full_bytes = nmax / 4;
++      for (size_t byte_start = 0; byte_start < full_bytes; byte_start++) {
++        const double* __restrict__ g4 = dlut[bed[byte_start]];
++        // unroll 4 genotypes
++        for(int j=0;j<4;j++){
++          const double g = g4[j];
++          gptr[index] = g;
++          if(g < 0.0){ // missing coded -3
++            missing_idx.push_back(index);
++          } else {
++            total += g;
++            snp_data->ns1++;
++            if (!split_pheno){
++              if(g >= 2.0) snp_data->n_aa++;
++              else if(g == 0.0) snp_data->n_rr++;
++            }
++          }
++          index++;
++        }
++      }
++      // trailing <4 samples
++      if(full_bytes < nbytes){
++        const double* __restrict__ g4 = dlut[bed[full_bytes]];
++        for(int j=0; j<4 && index < nmax; j++){
++          const double g = g4[j];
++          gptr[index] = g;
++          if(g < 0.0){
++            missing_idx.push_back(index);
++          } else {
++            total += g;
++            snp_data->ns1++;
++            if (!split_pheno){
++              if(g >= 2.0) snp_data->n_aa++;
++              else if(g == 0.0) snp_data->n_rr++;
++            }
++          }
++          index++;
++        }
++      }
++    } else if(!any_ignore && !ref_first){
++      for (size_t byte_start = 0; byte_start < nbytes; byte_start++) {
++        const double* __restrict__ g4 = dlut[bed[byte_start]];
++        for(int bit_start = 0; bit_start < 4; bit_start++, i++){
++          if(i >= nmax) break;
++          const double g = g4[bit_start];
++          gptr[index] = g;
++          if( in_an[index] ){
++            if(g < 0.0){
++              missing_idx.push_back(index);
++            } else {
++              total += g;
++              snp_data->ns1++;
++              if (!split_pheno){
++                if(g >= 2.0) snp_data->n_aa++;
++                else if(g == 0.0) snp_data->n_rr++;
++              }
++            }
++          } else {
++            gptr[index] = 0.0;
++          }
++          index++;
++        }
++      }
++    } else {
++      for (size_t byte_start = 0; byte_start < nbytes; byte_start++) {
++        const double* __restrict__ g4 = dlut[bed[byte_start]];
++        for(int bit_start = 0; bit_start < 4; bit_start++, i++){
++          if(i >= nmax) break;
++          if( ignore[i] ) continue;
++          double g = g4[bit_start];
++          if(ref_first && (g >= 0.0)) g = 2.0 - g;
++          gptr[index] = g;
++          if( in_an[index] ){
++            if(g < 0.0){
++              missing_idx.push_back(index);
++            } else {
++              total += g;
++              snp_data->ns1++;
++              if (!split_pheno){
++                if(g >= 2.0) snp_data->n_aa++;
++                else if(g == 0.0) snp_data->n_rr++;
++              }
++            }
++          } else {
++            gptr[index] = 0.0;
++          }
++          index++;
++        }
++      }
++    }
++    double mac = total; // autosomal diploid
++    compute_mac(true, mac, total, 0, 0, infosnp->MAC_fail_if_checked, infosnp->apply_diff_MAC_filter, snp_data, params);
++    if(snp_data->ignored) return;
++    compute_aaf_info(total, 0, false, snp_data, params);
++    if(params->with_flip) flip_geno(total, Geno, snp_data, params);
++    for(uint32_t ix : missing_idx) gptr[ix] = total;
++    return;
++  }
+   uint32_t const nmax = filters->ind_ignore.size();
+   uint32_t i, index ;
+   double total, mac, mval, sum_pos;
+@@ -2858,18 +2997,35 @@
+ 
+ void prep_snp_stats(variant_block* snp_data, struct param const* params){
+ 
+-  // reset variant info
+-  snp_data->af = ArrayXd::Zero(params->n_pheno);
+-  snp_data->af_case = ArrayXd::Zero(params->n_pheno);
+-  snp_data->af_control = ArrayXd::Zero(params->n_pheno);
+-  snp_data->mac = ArrayXd::Zero(params->n_pheno);
+-  snp_data->info = ArrayXd::Zero(params->n_pheno);
+-  snp_data->cf_burden = ArrayXd::Constant(params->n_pheno, -1);
+-  snp_data->nmales = ArrayXi::Zero(params->n_pheno);
+-  snp_data->ns = ArrayXi::Zero(params->n_pheno);
+-  snp_data->ns_case = ArrayXi::Zero(params->n_pheno);
+-  snp_data->ns_control= ArrayXi::Zero(params->n_pheno);
+-  snp_data->genocounts = MatrixXi::Zero(6, params->n_pheno);
++  // Opti2x H-S2-7 + H-S2-10: reuse storage; slim QT test-mode path skips unused arrays
++  const int np = params->n_pheno;
++  const bool slim_qt = params->test_mode && (params->trait_mode == 0) && !params->af_cc && !params->htp_out && !params->build_mask;
++  if(snp_data->af.size()!=np) snp_data->af.resize(np); snp_data->af.setZero();
++  if(snp_data->mac.size()!=np) snp_data->mac.resize(np); snp_data->mac.setZero();
++  if(snp_data->info.size()!=np) snp_data->info.resize(np); snp_data->info.setZero();
++  if(snp_data->ns.size()!=np) snp_data->ns.resize(np); snp_data->ns.setZero();
++  if(snp_data->nmales.size()!=np) snp_data->nmales.resize(np); snp_data->nmales.setZero();
++  if(!slim_qt){
++    if(snp_data->af_case.size()!=np) snp_data->af_case.resize(np); snp_data->af_case.setZero();
++    if(snp_data->af_control.size()!=np) snp_data->af_control.resize(np); snp_data->af_control.setZero();
++    if(snp_data->cf_burden.size()!=np) snp_data->cf_burden.resize(np);
++    snp_data->cf_burden.setConstant(-1);
++    if(snp_data->ns_case.size()!=np) snp_data->ns_case.resize(np); snp_data->ns_case.setZero();
++    if(snp_data->ns_control.size()!=np) snp_data->ns_control.resize(np); snp_data->ns_control.setZero();
++    if(snp_data->genocounts.rows()!=6 || snp_data->genocounts.cols()!=np)
++      snp_data->genocounts.resize(6, np);
++    snp_data->genocounts.setZero();
++  } else {
++    // keep sizes valid for any incidental readers; avoid per-SNP setZero of unused blocks
++    if(snp_data->af_case.size()!=np) { snp_data->af_case.resize(np); snp_data->af_case.setZero(); }
++    if(snp_data->af_control.size()!=np) { snp_data->af_control.resize(np); snp_data->af_control.setZero(); }
++    if(snp_data->cf_burden.size()!=np) { snp_data->cf_burden.resize(np); snp_data->cf_burden.setConstant(-1); }
++    if(snp_data->ns_case.size()!=np) { snp_data->ns_case.resize(np); snp_data->ns_case.setZero(); }
++    if(snp_data->ns_control.size()!=np) { snp_data->ns_control.resize(np); snp_data->ns_control.setZero(); }
++    if(snp_data->genocounts.rows()!=6 || snp_data->genocounts.cols()!=np) {
++      snp_data->genocounts.resize(6, np); snp_data->genocounts.setZero();
++    }
++  }
+   snp_data->ignored = false;
+   snp_data->skip_int = false;
+   snp_data->fitHLM = false;
+@@ -2877,9 +3033,13 @@
+   snp_data->ns1 = 0, snp_data->n_rr = 0, snp_data->n_aa = 0;
+   if (params->skip_dosage_comp) {
+     snp_data->ns1_adj = 0;
+-    if(params->af_cc) snp_data->ns_case_adj = ArrayXi::Zero(params->n_pheno);
++    if(params->af_cc) {
++      if(snp_data->ns_case_adj.size()!=np) snp_data->ns_case_adj.resize(np);
++      snp_data->ns_case_adj.setZero();
++    }
+   }
+-  snp_data->ignored_trait = ArrayXb::Constant(params->n_pheno, false);
++  if(snp_data->ignored_trait.size()!=np) snp_data->ignored_trait.resize(np);
++  snp_data->ignored_trait.setConstant(false);
+ 
+ }
+ 
+@@ -3163,20 +3323,11 @@
+ 
+ // for rarer variants, use sparse format
+ void check_sparse_G(int const& isnp, int const& thread_num, struct geno_block* gblock, uint32_t const& nsamples, const Ref<const ArrayXb>& mask, int const& n_zero, const double& prop_zero_thr){
+-
++  // Opti2x H-S2-8 ceiling probe: force dense QT path (may change rare-SNP numerics)
+   data_thread* snp_data = &(gblock->thread_data[thread_num]);
+-  MapArXd Geno ( gblock->Gmat.col(isnp).data(), nsamples, 1);
+-
+-  if (n_zero != -1)
+-    snp_data->is_sparse = (n_zero >= (nsamples * prop_zero_thr));
+-  else
+-    snp_data->is_sparse = (mask && (Geno != 0)).count() <= (nsamples * (1 - prop_zero_thr));
+-
+-  if(snp_data->is_sparse) // get nonzero entries
+-    snp_data->Gsparse = mask.select(Geno,0).matrix().sparseView();
+-
+-  // for SPA
+-  if( snp_data->fastSPA ) snp_data->fastSPA = snp_data->is_sparse;
++  (void)isnp; (void)nsamples; (void)mask; (void)n_zero; (void)prop_zero_thr;
++  snp_data->is_sparse = false;
++  snp_data->fastSPA = false;
+ }
+ 
+ // mean impute (only individuals who are not masked)
+@@ -3243,8 +3394,9 @@
+ 
+   if(snp_data->ignored) return;
+ 
+-  VectorXd beta = X.transpose() * Graw;
+-  Graw -= X * beta;
++  VectorXd beta(X.cols());
++  beta.noalias() = X.transpose() * Graw;
++  Graw.noalias() -= X * beta;
+ 
+   // already computed
+   if(params.skip_scaleG) return; // don't scale

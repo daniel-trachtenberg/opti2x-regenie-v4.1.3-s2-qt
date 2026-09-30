@@ -1,0 +1,11 @@
+{"id":"H-S2-1","status":"REJECT","speedup":0.84,"oracle":"PASS","note":"n_zero pre-flip regression"}
+{"id":"H-S2-2","status":"ACCEPT","speedup":1.27,"oracle":"PASS","note":"fast autosomal decode"}
+{"id":"H-S2-2b","status":"ACCEPT","speedup":1.45,"oracle":"PASS","note":"raw pointer decode"}
+{"id":"H-S2-3","status":"ACCEPT","speedup":1.07,"oracle":"PASS","note":"sparse mean-impute"}
+{"id":"H-S2-4","status":"REJECT","speedup":1.02,"oracle":"PASS","note":"resid noalias noise"}
+{"id":"H-S2-5","status":"REJECT","speedup":1.48,"oracle":"FAIL","note":"batch resid GEMM FP order"}
+{"id":"H-S2-6","status":"ACCEPT","speedup":1.62,"oracle":"PASS","note":"int8 LUT decode"}
+{"id":"H-S2-7","status":"ACCEPT","speedup":1.67,"oracle":"PASS","note":"prep setZero"}
+{"id":"H-S2-8","status":"ACCEPT","speedup":1.86,"oracle":"PASS","note":"force dense QT"}
+{"id":"H-S2-9","status":"ACCEPT","speedup":1.86,"oracle":"PASS","note":"no added wall vs H-S2-8"}
+{"id":"H-S2-10","status":"ACCEPT","speedup":2.26,"oracle":"PASS","wave":2,"note":"double LUT + all-in-analysis + slim prep; N30 lower_95 2.25x QUALIFIED"}
